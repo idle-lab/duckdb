@@ -1,0 +1,58 @@
+# name: test/sql/index/art/scan/test_multi_index_scan.test
+# description: Test index scans using multiple single-column ART indexes.
+# group: [scan]
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+statement ok
+CREATE TABLE multi_index AS
+SELECT a::INTEGER AS a, b::INTEGER AS b, (a * 100 + b)::INTEGER AS payload
+FROM range(100) a(a), range(100) b(b);
+
+statement ok
+CREATE INDEX multi_index_a ON multi_index(a);
+
+statement ok
+CREATE INDEX multi_index_b ON multi_index(b);
+
+# Both filters are covered by separate ART indexes.
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM multi_index WHERE a = 42 AND b = 7;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT payload FROM multi_index WHERE a = 42 AND b = 7;
+----
+4207
+
+# IN filters produce a union within one ART and an intersection between ARTs.
+
+query I rowsort
+SELECT payload FROM multi_index WHERE a IN (1, 42) AND b = 7;
+----
+107
+4207
+
+# Compound ART indexes remain unsupported for index scans.
+
+statement ok
+CREATE TABLE compound_index(a INTEGER, b INTEGER, payload INTEGER);
+
+statement ok
+INSERT INTO compound_index SELECT a, b, payload FROM multi_index;
+
+statement ok
+CREATE INDEX compound_index_ab ON compound_index(a, b);
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM compound_index WHERE a = 42 AND b = 7;
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+query I
+SELECT payload FROM compound_index WHERE a = 42 AND b = 7;
+----
+4207

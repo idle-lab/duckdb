@@ -1,0 +1,117 @@
+# name: test/sql/index/art/scan/test_index_scan_residual_filters.test
+# description: Test residual filters after fetching rows from ART indexes.
+# group: [scan]
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+statement ok
+CREATE TABLE residual_index AS
+SELECT a::INTEGER AS a, b::INTEGER AS b, (a * 100 + b)::INTEGER AS payload
+FROM range(100) a(a), range(100) b(b);
+
+statement ok
+CREATE INDEX residual_index_a ON residual_index(a);
+
+statement ok
+CREATE INDEX residual_index_b ON residual_index(b);
+
+# The indexed predicate narrows the row IDs and payload remains as a residual filter.
+
+query II
+EXPLAIN ANALYZE SELECT b FROM residual_index WHERE a = 42 AND payload = 4207;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT b FROM residual_index WHERE a = 42 AND payload = 4207;
+----
+7
+
+query II
+EXPLAIN ANALYZE SELECT a, payload FROM residual_index WHERE a = 42 AND payload = 4207;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+SELECT a, payload FROM residual_index WHERE a = 42 AND payload = 4207;
+----
+42	4207
+
+query I
+SELECT count(*) FROM residual_index WHERE a = 42 AND payload = 9999;
+----
+0
+
+# Residual filters are applied across multiple fetched batches, including empty output batches.
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM residual_index WHERE a >= 1 AND payload = 9999;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM residual_index WHERE a >= 1 AND payload = 9999;
+----
+1
+
+# Multiple indexes can be combined while another filter remains residual.
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM residual_index WHERE a = 42 AND b = 7 AND payload = 4207;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT payload FROM residual_index WHERE a = 42 AND b = 7 AND payload = 4207;
+----
+4207
+
+# An index that exceeds the scan threshold can remain residual while another index drives the scan.
+
+statement ok
+CREATE INDEX residual_index_payload ON residual_index(payload);
+
+statement ok
+SET index_scan_percentage = 0.000001;
+
+statement ok
+SET index_scan_max_count = 2;
+
+query II
+EXPLAIN ANALYZE SELECT a, payload FROM residual_index WHERE a = 42 AND payload = 4207;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+SELECT a, payload FROM residual_index WHERE a = 42 AND payload = 4207;
+----
+42	4207
+
+# Transaction-local rows are scanned separately with all filters.
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO residual_index VALUES (101, 102, 103);
+
+query I
+SELECT payload FROM residual_index WHERE a = 101 AND b = 102 AND payload = 103;
+----
+103
+
+# DML scans still apply residual filters before returning row IDs.
+
+query I
+DELETE FROM residual_index WHERE a = 42 AND payload = 4207;
+----
+1
+
+query I
+SELECT count(*) FROM residual_index WHERE a = 42 AND payload = 4207;
+----
+0
+
+statement ok
+ROLLBACK;

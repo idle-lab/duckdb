@@ -10,6 +10,7 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/execution/adaptive_filter.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -34,6 +35,7 @@
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -63,8 +65,10 @@ struct IndexScanLocalState : public LocalTableFunctionState {
 	ColumnFetchState fetch_state;
 	//! The current position in the local storage scan.
 	TableScanState scan_state;
-	//! The column IDs of the local storage scan.
+	//! The scanned column IDs.
 	vector<StorageIndex> column_ids;
+	//! Thread-local state for filters not covered by the indexes.
+	ScanFilterInfo residual_filter_info;
 	bool in_charge_of_final_stretch {false};
 	idx_t rows_scanned = 0;
 };
@@ -132,6 +136,41 @@ public:
 	mutex index_scan_lock;
 	//! Keep ART rowids and row-group trees paired while rowid-shifting index vacuum can run.
 	unique_ptr<StorageLockKey> vacuum_lock;
+	//! Filters that still need to be applied after fetching the indexed rows.
+	unique_ptr<TableFilterSet> residual_filters;
+
+private:
+	void ApplyResidualFilters(IndexScanLocalState &l_state, DataChunk &result) {
+		if (!residual_filters || result.size() == 0) {
+			return;
+		}
+
+		auto &filter_info = l_state.residual_filter_info;
+		auto &filter_list = filter_info.GetFilterList();
+		auto adaptive_filter = filter_info.GetAdaptiveFilter();
+		auto filter_state = filter_info.BeginFilter();
+		auto scan_count = result.size();
+		auto approved_tuple_count = scan_count;
+		SelectionVector sel;
+		sel.Initialize(nullptr);
+
+		const auto &permutation = adaptive_filter->GetPermutation();
+		for (idx_t i = 0; i < filter_list.size(); i++) {
+			auto &filter = filter_list[permutation[i]];
+			auto &result_vector = result.data[filter.scan_column_index];
+			ColumnSegment::FilterSelection(sel, result_vector, *filter.filter_state, scan_count, approved_tuple_count);
+			if (approved_tuple_count == 0) {
+				break;
+			}
+		}
+		filter_info.EndFilter(filter_state);
+
+		if (approved_tuple_count == 0) {
+			result.Reset();
+		} else if (approved_tuple_count != scan_count) {
+			result.Slice(sel, approved_tuple_count);
+		}
+	}
 
 public:
 	unique_ptr<LocalTableFunctionState> InitLocalState(ExecutionContext &context,
@@ -150,6 +189,9 @@ public:
 
 		for (const auto &col_idx : input.column_indexes) {
 			l_state->column_ids.push_back(bind_data.table.GetStorageIndex(col_idx));
+		}
+		if (residual_filters) {
+			l_state->residual_filter_info.Initialize(context.client, *residual_filters, l_state->column_ids);
 		}
 		l_state->scan_state.Initialize(l_state->column_ids, context.client, input.filters.get());
 		local_storage.InitializeScan(storage, l_state->scan_state.local_state, input.filters);
@@ -208,9 +250,11 @@ public:
 				if (CanRemoveFilterColumns()) {
 					l_state.all_columns.Reset();
 					storage.Fetch(tx, l_state.all_columns, column_ids, local_vector, scan_count, l_state.fetch_state);
+					ApplyResidualFilters(l_state, l_state.all_columns);
 					output.ReferenceColumns(l_state.all_columns, projection_ids);
 				} else {
 					storage.Fetch(tx, output, column_ids, local_vector, scan_count, l_state.fetch_state);
+					ApplyResidualFilters(l_state, output);
 				}
 
 				l_state.rows_scanned += scan_count;
@@ -502,9 +546,11 @@ unique_ptr<GlobalTableFunctionState> DuckTableScanInitGlobal(ClientContext &cont
 
 unique_ptr<GlobalTableFunctionState> DuckIndexScanInitGlobal(ClientContext &context, TableFunctionInitInput &input,
                                                              const TableScanBindData &bind_data, set<row_t> &row_ids,
-                                                             unique_ptr<StorageLockKey> vacuum_lock) {
+                                                             unique_ptr<StorageLockKey> vacuum_lock,
+                                                             unique_ptr<TableFilterSet> residual_filters) {
 	auto g_state = make_uniq<DuckIndexScanState>(context, input.bind_data.get());
 	g_state->vacuum_lock = std::move(vacuum_lock);
+	g_state->residual_filters = std::move(residual_filters);
 	g_state->finished_first_phase = row_ids.empty() ? true : false;
 	g_state->started_last_phase = false;
 
@@ -705,10 +751,10 @@ vector<unique_ptr<Expression>> ExtractFilterExpressions(const ColumnDefinition &
 	return expressions;
 }
 
-bool TryScanIndex(ART &art, IndexEntry &entry, const ColumnList &column_list, TableFunctionInitInput &input,
-                  TableFilterSet &filter_set, idx_t max_count, set<row_t> &row_ids) {
+static bool TryScanSingleIndex(ART &art, IndexEntry &entry, const ColumnList &column_list,
+                               TableFunctionInitInput &input, TableFilterSet &filter_set, idx_t max_count,
+                               set<row_t> &row_ids, ProjectionIndex &covered_filter) {
 	// FIXME: No support for index scans on compound ARTs.
-	// See note above on multi-filter support.
 	if (art.unbound_expressions.size() > 1) {
 		return false;
 	}
@@ -741,12 +787,9 @@ bool TryScanIndex(ART &art, IndexEntry &entry, const ColumnList &column_list, Ta
 				return;
 			}
 
+			// A single-column index expression binds every column reference to its sole input.
 			auto &bound_column_ref_expr = expr.Cast<BoundColumnRefExpression>();
-
-			// If the bound column references the index column, use updated_index_column
-			if (bound_column_ref_expr.Binding().column_index == indexed_columns[0]) {
-				bound_column_ref_expr.BindingMutable().column_index = updated_index_column;
-			}
+			bound_column_ref_expr.BindingMutable().column_index = updated_index_column;
 		});
 	}
 
@@ -806,7 +849,59 @@ bool TryScanIndex(ART &art, IndexEntry &entry, const ColumnList &column_list, Ta
 			}
 		}
 	}
+	covered_filter = storage_index;
 	return true;
+}
+
+static void IntersectRowIds(set<row_t> &row_ids, const set<row_t> &candidate_row_ids) {
+	auto row_id = row_ids.begin();
+	auto candidate_row_id = candidate_row_ids.begin();
+	while (row_id != row_ids.end() && candidate_row_id != candidate_row_ids.end()) {
+		if (*row_id < *candidate_row_id) {
+			row_id = row_ids.erase(row_id);
+		} else if (*candidate_row_id < *row_id) {
+			candidate_row_id++;
+		} else {
+			row_id++;
+			candidate_row_id++;
+		}
+	}
+	row_ids.erase(row_id, row_ids.end());
+}
+
+struct IndexScanResult {
+	bool found_index = false;
+	set<row_t> row_ids;
+	set<ProjectionIndex> covered_filters;
+};
+
+static IndexScanResult TryScanIndexes(TableIndexList &indexes, const ColumnList &column_list,
+                                      TableFunctionInitInput &input, TableFilterSet &filter_set, idx_t max_count) {
+	IndexScanResult result;
+	for (auto &entry : indexes.IndexEntries()) {
+		auto &index = *entry.index;
+		if (index.GetIndexType() != ART::TYPE_NAME) {
+			continue;
+		}
+		D_ASSERT(index.IsBound());
+		auto &art = index.Cast<ART>();
+		set<row_t> candidate_row_ids;
+		ProjectionIndex covered_filter;
+		if (!TryScanSingleIndex(art, entry, column_list, input, filter_set, max_count, candidate_row_ids,
+		                        covered_filter)) {
+			continue;
+		}
+		if (!result.covered_filters.insert(covered_filter).second) {
+			continue;
+		}
+		if (!result.found_index) {
+			result.row_ids = std::move(candidate_row_ids);
+			result.found_index = true;
+		} else {
+			IntersectRowIds(result.row_ids, candidate_row_ids);
+		}
+	}
+	return result;
 }
 
 unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -828,16 +923,6 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 
 	auto &filter_set = *input.filters;
 
-	// FIXME: We currently only support scanning one ART with one filter.
-	// If multiple filters exist, i.e., a = 11 AND b = 24, we need to
-	// 1.	1.1. Find + scan one ART for a = 11.
-	//		1.2. Find + scan one ART for b = 24.
-	//		1.3. Return the intersecting row IDs.
-	// 2. (Reorder and) scan a single ART with a compound key of (a, b).
-	if (filter_set.FilterCount() != 1) {
-		return DuckTableScanInitGlobal(context, input, storage, bind_data);
-	}
-
 	auto &info = storage.GetDataTableInfo();
 	auto &indexes = info->GetIndexes();
 	if (indexes.Empty()) {
@@ -851,10 +936,6 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 	auto total_rows_from_percentage = LossyNumericCast<idx_t>(double(total_rows) * scan_percentage);
 	auto max_count = MaxValue(scan_max_count, total_rows_from_percentage);
 
-	auto &column_list = duck_table.GetColumns();
-	bool index_scan = false;
-	set<row_t> row_ids;
-
 	info->BindIndexes(context, ART::TYPE_NAME);
 
 	// Exclude rowid-shifting vacuum from the ART probe until the index scan finishes: collected rowids must be
@@ -867,24 +948,20 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 		vacuum_lock = DuckTransactionManager::Get(attached).SharedVacuumLock();
 	}
 
-	for (auto &entry : indexes.IndexEntries()) {
-		auto &index = *entry.index;
-		if (index.GetIndexType() != ART::TYPE_NAME) {
-			continue;
-		}
-		D_ASSERT(index.IsBound());
-		auto &art = index.Cast<ART>();
-		index_scan = TryScanIndex(art, entry, column_list, input, filter_set, max_count, row_ids);
-		if (index_scan) {
-			// found an index - break
-			break;
-		}
-	}
-
-	if (!index_scan) {
+	auto index_scan = TryScanIndexes(indexes, duck_table.GetColumns(), input, filter_set, max_count);
+	if (!index_scan.found_index) {
 		return DuckTableScanInitGlobal(context, input, storage, bind_data);
 	}
-	return DuckIndexScanInitGlobal(context, input, bind_data, row_ids, std::move(vacuum_lock));
+
+	auto residual_filters = filter_set.Copy();
+	for (const auto covered_filter : index_scan.covered_filters) {
+		residual_filters->RemoveFilterByColumnIndex(covered_filter);
+	}
+	if (!residual_filters->HasFilters()) {
+		residual_filters.reset();
+	}
+	return DuckIndexScanInitGlobal(context, input, bind_data, index_scan.row_ids, std::move(vacuum_lock),
+	                               std::move(residual_filters));
 }
 
 static unique_ptr<BaseStatistics> TableScanStatistics(ClientContext &context, TableFunctionGetStatisticsInput &input) {

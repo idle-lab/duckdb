@@ -25,8 +25,8 @@ static idx_t NextNeedle(const char *input_haystack, idx_t size_haystack, const c
 	return size_haystack;
 }
 
-static string_t ReplaceScalarFunction(const string_t &haystack, const string_t &needle, const string_t &thread,
-                                      vector<char> &result) {
+static string_t ReplaceMatches(const string_t &haystack, const string_t &needle, const string_t &thread,
+                               idx_t match_position, vector<char> &result) {
 	// Get information about the needle, the haystack and the "thread"
 	auto input_haystack = haystack.GetData();
 	auto size_haystack = haystack.GetSize();
@@ -40,23 +40,14 @@ static string_t ReplaceScalarFunction(const string_t &haystack, const string_t &
 	//  Reuse the buffer
 	result.clear();
 
-	for (;;) {
-		//  Append the non-matching characters
-		auto string_position = NextNeedle(input_haystack, size_haystack, input_needle, size_needle);
-		result.insert(result.end(), input_haystack, input_haystack + string_position);
-		input_haystack += string_position;
-		size_haystack -= string_position;
-
-		//  Stop when we have read the entire haystack
-		if (size_haystack == 0) {
-			break;
-		}
-
-		//  Replace the matching characters
+	do {
+		result.insert(result.end(), input_haystack, input_haystack + match_position);
 		result.insert(result.end(), input_thread, input_thread + size_thread);
-		input_haystack += size_needle;
-		size_haystack -= size_needle;
-	}
+		input_haystack += match_position + size_needle;
+		size_haystack -= match_position + size_needle;
+		match_position = NextNeedle(input_haystack, size_haystack, input_needle, size_needle);
+	} while (match_position < size_haystack);
+	result.insert(result.end(), input_haystack, input_haystack + size_haystack);
 
 	return string_t(result.data(), UnsafeNumericCast<uint32_t>(result.size()));
 }
@@ -67,12 +58,22 @@ static void ReplaceFunction(DataChunk &args, ExpressionState &state, Vector &res
 	const auto &thread_vector = args.data[2];
 
 	vector<char> buffer;
+	bool references_input_heap = false;
 	auto &heap = StringVector::GetStringHeap(result);
 	TernaryExecutor::Execute<string_t, string_t, string_t, string_t>(
 	    haystack_vector, needle_vector, thread_vector, result,
 	    [&](string_t input_string, string_t needle_string, string_t thread_string) {
-		    return heap.AddString(ReplaceScalarFunction(input_string, needle_string, thread_string, buffer));
+		    auto match_position = NextNeedle(input_string.GetData(), input_string.GetSize(), needle_string.GetData(),
+		                                     needle_string.GetSize());
+		    if (match_position == input_string.GetSize()) {
+			    references_input_heap |= !input_string.IsInlined();
+			    return input_string;
+		    }
+		    return heap.AddString(ReplaceMatches(input_string, needle_string, thread_string, match_position, buffer));
 	    });
+	if (references_input_heap) {
+		StringVector::AddHeapReference(result, haystack_vector);
+	}
 }
 
 ScalarFunction ReplaceFun::GetFunction() {

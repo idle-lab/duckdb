@@ -63,6 +63,19 @@ select REPLACE(a, 'H', '') FROM strings WHERE b IS NOT NULL
 ello
 Motöread
 
+# Keep matched and unmatched long strings from temporary inputs across chunks
+query I
+WITH replaced AS MATERIALIZED (
+    SELECT i, replace(repeat('duck', 8) || i::VARCHAR,
+                      CASE i % 3 WHEN 0 THEN 'duck' WHEN 1 THEN '' ELSE '#' END, '鹅') AS s
+    FROM range(8192) t(i)
+    WHERE i % 5 <> 0
+)
+SELECT count(*) FROM replaced
+WHERE s IS DISTINCT FROM (repeat(CASE WHEN i % 3 = 0 THEN '鹅' ELSE 'duck' END, 8) || i::VARCHAR);
+----
+0
+
 # test incorrect usage of replace
 statement error
 select REPLACE(1)
